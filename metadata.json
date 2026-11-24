@@ -1,0 +1,7 @@
+{
+  "uuid": "pomodoro-mochi@arya",
+  "name": "Pomodoro Mochi",
+  "description": "Timer Pomodoro + karakter interaktif. Ekspresi & animasi halus, mata ngikutin kursor, bisa dielus, ngambek kalau scroll saat fokus, bisa di-drag & dimatikan, plus statistik harian. Baru: suara notif, ekspor data, pengaturan mata/animasi, saran istirahat.",
+  "shell-version": ["51"],
+  "version": 5
+}
