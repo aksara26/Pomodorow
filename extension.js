@@ -16,6 +16,9 @@ import Character from './character.js';
 // ───────────────────────────── Pengaturan ─────────────────────────────
 const DEFAULT_DURATIONS = {focus: 25, short: 5, long: 15}; // menit; bisa diubah dari menu
 const DURATION_LIMITS = {focus: [5, 120, 5], short: [1, 30, 1], long: [5, 60, 5]}; // [min, maks, langkah]
+const DEFAULT_DAILY_GOAL = 4;
+const DAILY_GOAL_LIMITS = [1, 20];
+const TASK_LABEL_MAX_LENGTH = 80;
 
 const CFG = {
     cyclesBeforeLong: 4,
@@ -28,6 +31,8 @@ const CORNER_LABEL = {
 };
 const CHARACTER_SIZES = ['small', 'medium', 'large'];
 const CHARACTER_SIZE_LABEL = {small: 'Kecil', medium: 'Sedang', large: 'Besar'};
+const CHARACTER_THEMES = ['classic', 'bow', 'flower'];
+const CHARACTER_THEME_LABEL = {classic: 'Original', bow: 'Pita pink', flower: 'Bunga'};
 const CHARACTER_SCALE_STEPS = [0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6];
 const DAY_NAMES = ['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab'];
 
@@ -66,6 +71,7 @@ class Store {
                 expressiveMode: true,
                 characterSize: 'medium',
                 characterScale: 1.0,
+                characterTheme: 'classic',
                 corner: 'br',
                 characterPos: null,
                 durations: {...DEFAULT_DURATIONS},
@@ -77,9 +83,12 @@ class Store {
                 animationSpeed: 'normal',
                 breakSuggestions: true,
                 autoStartBreaks: false,
+                dailyGoalSessions: DEFAULT_DAILY_GOAL,
+                currentTask: '',
             },
             timer: null,
             days: {},
+            taskSessions: [],
             reminders: [],
         };
         this._load();
@@ -98,8 +107,16 @@ class Store {
                 this.data.settings.corner = 'br';
             if (!CHARACTER_SIZES.includes(this.data.settings.characterSize))
                 this.data.settings.characterSize = 'medium';
+            if (!CHARACTER_THEMES.includes(this.data.settings.characterTheme))
+                this.data.settings.characterTheme = 'classic';
             if (!CHARACTER_SCALE_STEPS.includes(this.data.settings.characterScale))
                 this.data.settings.characterScale = 1.0;
+            const goal = Number(this.data.settings.dailyGoalSessions);
+            this.data.settings.dailyGoalSessions = Number.isInteger(goal) &&
+                goal >= DAILY_GOAL_LIMITS[0] && goal <= DAILY_GOAL_LIMITS[1]
+                ? goal : DEFAULT_DAILY_GOAL;
+            this.data.settings.currentTask = typeof this.data.settings.currentTask === 'string'
+                ? this.data.settings.currentTask.trim().slice(0, TASK_LABEL_MAX_LENGTH) : '';
             // Validate new settings
             if (!EYE_SENSITIVITY_PRESETS.includes(this.data.settings.eyeSensitivity))
                 this.data.settings.eyeSensitivity = 'normal';
@@ -129,6 +146,17 @@ class Store {
             this.data.settings.durations = d;
             this.data.timer = parsed.timer ?? null;
             this.data.days = parsed.days ?? {};
+            this.data.taskSessions = Array.isArray(parsed.taskSessions)
+                ? parsed.taskSessions.filter(session =>
+                    session && typeof session.task === 'string' &&
+                    typeof session.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(session.date) &&
+                    Number.isFinite(session.durationSeconds) && session.durationSeconds > 0)
+                    .map(session => ({
+                        task: session.task.trim().slice(0, TASK_LABEL_MAX_LENGTH),
+                        date: session.date,
+                        durationSeconds: session.durationSeconds,
+                    })).filter(session => session.task.length > 0)
+                : [];
             this.data.reminders = parsed.reminders ?? [];
         } catch (e) {
             // File belum ada (pertama kali dijalankan) atau rusak: pakai default.
@@ -144,6 +172,7 @@ class Store {
             if (key < cutoffKey)
                 delete this.data.days[key];
         }
+        this.data.taskSessions = this.data.taskSessions.filter(session => session.date >= cutoffKey);
     }
 
     today() {
@@ -154,6 +183,32 @@ class Store {
 
     dayOrEmpty(key) {
         return this.data.days[key] ?? {sessions: 0, focusSeconds: 0, pets: 0, sulks: 0, skipped: 0};
+    }
+
+    addTaskSession(task, completedAt, durationSeconds) {
+        const label = String(task ?? '').trim().slice(0, TASK_LABEL_MAX_LENGTH);
+        if (!label)
+            return;
+        this.data.taskSessions.push({
+            date: dayKey(new Date(completedAt)),
+            task: label,
+            durationSeconds: Math.max(0, Math.round(durationSeconds)),
+        });
+        this.markDirty();
+    }
+
+    getStreak(goal) {
+        const cursor = new Date();
+        if (this.dayOrEmpty(dayKey(cursor)).sessions < goal)
+            cursor.setDate(cursor.getDate() - 1);
+        let streak = 0;
+        for (let i = 0; i < 90; i++) {
+            if (this.dayOrEmpty(dayKey(cursor)).sessions < goal)
+                break;
+            streak++;
+            cursor.setDate(cursor.getDate() - 1);
+        }
+        return streak;
     }
 
     getReminders() {
@@ -259,6 +314,7 @@ class Store {
             version: 1,
             settings: this.data.settings,
             days: this.data.days,
+            taskSessions: this.data.taskSessions,
             reminders: this.data.reminders,
         };
         GLib.file_set_contents(path, new TextEncoder().encode(JSON.stringify(exportData, null, 2)));
@@ -276,6 +332,14 @@ class Store {
         for (const [date, day] of Object.entries(this.data.days).sort()) {
             const focusMin = Math.round(day.focusSeconds / 60);
             csv += `${date},${day.sessions},${focusMin},${day.pets},${day.sulks},${day.skipped}\n`;
+        }
+        if (this.data.taskSessions.length > 0) {
+            const csvCell = value => `"${String(value).replace(/"/g, '""')}"`;
+            csv += '\nTanggal,Tugas,Sesi,Waktu Fokus (menit)\n';
+            for (const session of this.data.taskSessions) {
+                csv += `${session.date},${csvCell(session.task)},1,` +
+                    `${Math.round(session.durationSeconds / 60)}\n`;
+            }
         }
         GLib.file_set_contents(path, new TextEncoder().encode(csv));
         return path;
@@ -336,6 +400,7 @@ export default class PomodoroMochiExtension extends Extension {
 
         this._phase = 'focus';      // 'focus' | 'short' | 'long'
         this._cycle = 0;            // jumlah sesi fokus selesai dalam putaran ini
+        this._focusTask = '';
         this._running = false;
         this._phaseTotal = this._phaseSeconds('focus');
         this._remaining = this._phaseTotal;
@@ -373,6 +438,7 @@ export default class PomodoroMochiExtension extends Extension {
             getTimerPosition: () => this._timerPosition(),
         });
         this._character.setEnabled(this._store.data.settings.characterEnabled);
+        this._character.setTheme(this._store.data.settings.characterTheme);
         // Apply saved eye/animation settings
         this._character.setEyeSensitivity(this._store.data.settings.eyeSensitivity);
         this._character.setBlinkFrequency(this._store.data.settings.blinkFrequency);
@@ -435,6 +501,9 @@ export default class PomodoroMochiExtension extends Extension {
         this._eyeSenseItem = null;
         this._blinkFreqItem = null;
         this._animSpeedItem = null;
+        this._themeItem = null;
+        this._taskEntry = null;
+        this._goalLabel = null;
         this._store = null;
     }
 
@@ -464,6 +533,7 @@ export default class PomodoroMochiExtension extends Extension {
             this._lastTick = now;
             this._running = true;
             if (this._phase === 'focus' && fresh) {
+                this._focusTask = this._store.data.settings.currentTask;
                 this._character.onFocusStart();
                 this._store.playSound('focusStart');
             }
@@ -477,6 +547,7 @@ export default class PomodoroMochiExtension extends Extension {
                 this._store.today().skipped += 1;
                 this._store.markDirty();
             }
+            this._focusTask = '';
             this._enterPhase('short'); // melewati fokus tidak dihitung sebagai sesi
         } else {
             this._enterPhase('focus');
@@ -488,6 +559,7 @@ export default class PomodoroMochiExtension extends Extension {
 
     _reset() {
         this._cycle = 0;
+        this._focusTask = '';
         this._enterPhase('focus');
         this._running = false;
         this._character.onTimerReset();
@@ -498,6 +570,8 @@ _completePhase() {
         const now = Date.now();
         if (this._phase === 'focus') {
             this._store.today().sessions += 1;
+            this._store.addTaskSession(this._focusTask, now, this._phaseTotal);
+            this._focusTask = '';
             this._store.markDirty();
             this._cycle += 1;
             const isLong = this._cycle % CFG.cyclesBeforeLong === 0;
@@ -531,6 +605,9 @@ _completePhase() {
     }
 
     _tick() {
+        // The shell can destroy the panel before disable() runs on logout.
+        if (!this._indicator || !this._character)
+            return;
         const now = Date.now();
         if (this._running) {
             const dt = Math.min((now - this._lastTick) / 1000, 5);
@@ -630,6 +707,7 @@ _completePhase() {
             total: this._phaseTotal,
             endAt: this._running ? this._endAt : 0,
             savedAt: now,
+            task: this._focusTask,
         };
         this._store.markDirty();
     }
@@ -643,6 +721,9 @@ _completePhase() {
         const now = Date.now();
         this._cycle = Number.isFinite(t.cycle) ? t.cycle : 0;
         this._enterPhase(t.phase);
+        this._focusTask = t.phase === 'focus'
+            ? String(t.task ?? this._store.data.settings.currentTask).trim().slice(0, TASK_LABEL_MAX_LENGTH)
+            : '';
         const full = Number.isFinite(t.total) && t.total > 0 ? Math.round(t.total) : this._phaseTotal;
         this._phaseTotal = full;
         const remainingAtSave = Math.min(Math.max(Math.round(t.remaining ?? full), 0), full);
@@ -683,17 +764,15 @@ _completePhase() {
 
         const menu = this._indicator.menu;
 
+        // ── Timer ─────────────────────────────────────────────────────
         this._statusItem = new PopupMenu.PopupMenuItem('', {reactive: false, can_focus: false});
         menu.addMenuItem(this._statusItem);
-
-        this._saveStatusItem = new PopupMenu.PopupMenuItem('', {reactive: false, can_focus: false});
-        menu.addMenuItem(this._saveStatusItem);
 
         this._toggleItem = new PopupMenu.PopupMenuItem('Mulai');
         this._toggleItem.connect('activate', () => this._toggle());
         menu.addMenuItem(this._toggleItem);
 
-        const skipItem = new PopupMenu.PopupMenuItem('Lewat fase ini aja');
+        const skipItem = new PopupMenu.PopupMenuItem('Lewat fase ini');
         skipItem.connect('activate', () => this._skip());
         menu.addMenuItem(skipItem);
 
@@ -701,7 +780,12 @@ _completePhase() {
         resetItem.connect('activate', () => this._reset());
         menu.addMenuItem(resetItem);
 
-        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        // ── Task ──────────────────────────────────────────────────────
+        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('📝 Tugas sesi ini'));
+        this._buildTaskInput(menu);
+
+        // ── Character ─────────────────────────────────────────────────
+        const characterMenu = this._addSubMenu(menu, '🐱 Karakter');
 
         const switchItem = new PopupMenu.PopupSwitchMenuItem(
             'Temanin aku', this._store.data.settings.characterEnabled);
@@ -711,7 +795,7 @@ _completePhase() {
             this._store.save();
             this._character.setEnabled(state);
         });
-        menu.addMenuItem(switchItem);
+        characterMenu.addMenuItem(switchItem);
 
         const expressiveItem = new PopupMenu.PopupSwitchMenuItem(
             'Mode ekspresif', this._store.data.settings.expressiveMode !== false);
@@ -721,20 +805,22 @@ _completePhase() {
             this._store.save();
             this._character.setExpressiveMode(state);
         });
-        menu.addMenuItem(expressiveItem);
+        characterMenu.addMenuItem(expressiveItem);
 
-        this._cornerItem = new PopupMenu.PopupMenuItem('');
-        this._updateCornerLabel();
-        this._cornerItem.connect('activate', () => {
-            const s = this._store.data.settings;
-            s.corner = CORNERS[(CORNERS.indexOf(s.corner) + 1) % CORNERS.length];
-            s.characterPos = null;
+        characterMenu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Tampilan'));
+
+        this._themeItem = new PopupMenu.PopupMenuItem('');
+        this._updateThemeLabel();
+        this._themeItem.connect('activate', () => {
+            const settings = this._store.data.settings;
+            const index = CHARACTER_THEMES.indexOf(settings.characterTheme);
+            settings.characterTheme = CHARACTER_THEMES[(index + 1) % CHARACTER_THEMES.length];
             this._store.markDirty();
             this._store.save();
-            this._updateCornerLabel();
-            this._character.resetPosition();
+            this._character.setTheme(settings.characterTheme);
+            this._updateThemeLabel();
         });
-        menu.addMenuItem(this._cornerItem);
+        characterMenu.addMenuItem(this._themeItem);
 
         this._sizeItem = new PopupMenu.PopupMenuItem('');
         this._updateSizeLabel();
@@ -747,7 +833,7 @@ _completePhase() {
             this._character.setSize(s.characterSize);
             this._updateSizeLabel();
         });
-        menu.addMenuItem(this._sizeItem);
+        characterMenu.addMenuItem(this._sizeItem);
 
         this._scaleItem = new PopupMenu.PopupBaseMenuItem({activate: false, can_focus: false});
         this._scaleLabel = new St.Label({
@@ -771,58 +857,74 @@ _completePhase() {
         this._scaleItem.add_child(scaleMinus);
         this._scaleItem.add_child(this._scaleLabel);
         this._scaleItem.add_child(scalePlus);
-        menu.addMenuItem(this._scaleItem);
+        characterMenu.addMenuItem(this._scaleItem);
 
-        const resetPosItem = new PopupMenu.PopupMenuItem('Balikin posisi awal');
+        this._cornerItem = new PopupMenu.PopupMenuItem('');
+        this._updateCornerLabel();
+        this._cornerItem.connect('activate', () => {
+            const s = this._store.data.settings;
+            s.corner = CORNERS[(CORNERS.indexOf(s.corner) + 1) % CORNERS.length];
+            s.characterPos = null;
+            this._store.markDirty();
+            this._store.save();
+            this._updateCornerLabel();
+            this._character.resetPosition();
+        });
+        characterMenu.addMenuItem(this._cornerItem);
+
+        const resetPosItem = new PopupMenu.PopupMenuItem('Balikin posisi');
         resetPosItem.connect('activate', () => {
             this._store.data.settings.characterPos = null;
             this._store.markDirty();
             this._store.save();
             this._character.resetPosition();
         });
-        menu.addMenuItem(resetPosItem);
+        characterMenu.addMenuItem(resetPosItem);
 
-        const backupItem = new PopupMenu.PopupMenuItem('Simpan cadangan');
-        backupItem.connect('activate', () => {
-            this._saveTimer();
-            if (!this._store.save()) {
-                Main.notify('Cadangan gagal', 'Data belum tersimpan.');
-                return;
-            }
-            try {
-                const path = this._store.createBackup();
-                Main.notify('Cadangan tersimpan', `Di ${path}`);
-            } catch (e) {
-                console.error(`Pomodoro Mochi: gagal membuat cadangan: ${e}`);
-                Main.notify('Cadangan gagal', 'Gagal menulis file cadangan.');
-            }
+        characterMenu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Gerak & ekspresi'));
+
+        this._eyeSenseItem = new PopupMenu.PopupMenuItem('');
+        this._updateEyeSenseLabel();
+        this._eyeSenseItem.connect('activate', () => {
+            const s = this._store.data.settings;
+            const idx = EYE_SENSITIVITY_PRESETS.indexOf(s.eyeSensitivity);
+            s.eyeSensitivity = EYE_SENSITIVITY_PRESETS[(idx + 1) % EYE_SENSITIVITY_PRESETS.length];
+            this._store.markDirty();
+            this._store.save();
+            this._updateEyeSenseLabel();
+            this._character.setEyeSensitivity?.(s.eyeSensitivity);
         });
-        menu.addMenuItem(backupItem);
+        characterMenu.addMenuItem(this._eyeSenseItem);
 
-        // Export data
-        const exportJsonItem = new PopupMenu.PopupMenuItem('Ekspor data (JSON)');
-        exportJsonItem.connect('activate', () => {
-            try {
-                const path = this._store.exportData();
-                Main.notify('Ekspor JSON', `Tersimpan di ${path}`);
-            } catch (e) {
-                Main.notify('Ekspor gagal', 'Gagal menulis file JSON.');
-            }
+        this._blinkFreqItem = new PopupMenu.PopupMenuItem('');
+        this._updateBlinkFreqLabel();
+        this._blinkFreqItem.connect('activate', () => {
+            const s = this._store.data.settings;
+            const idx = BLINK_FREQUENCY_PRESETS.indexOf(s.blinkFrequency);
+            s.blinkFrequency = BLINK_FREQUENCY_PRESETS[(idx + 1) % BLINK_FREQUENCY_PRESETS.length];
+            this._store.markDirty();
+            this._store.save();
+            this._updateBlinkFreqLabel();
+            this._character.setBlinkFrequency?.(s.blinkFrequency);
         });
-        menu.addMenuItem(exportJsonItem);
+        characterMenu.addMenuItem(this._blinkFreqItem);
 
-        const exportCsvItem = new PopupMenu.PopupMenuItem('Ekspor CSV (spreadsheet)');
-        exportCsvItem.connect('activate', () => {
-            try {
-                const path = this._store.exportCSV();
-                Main.notify('Ekspor CSV', `Tersimpan di ${path}`);
-            } catch (e) {
-                Main.notify('Ekspor gagal', 'Gagal menulis file CSV.');
-            }
+        this._animSpeedItem = new PopupMenu.PopupMenuItem('');
+        this._updateAnimSpeedLabel();
+        this._animSpeedItem.connect('activate', () => {
+            const s = this._store.data.settings;
+            const idx = ANIMATION_SPEED_PRESETS.indexOf(s.animationSpeed);
+            s.animationSpeed = ANIMATION_SPEED_PRESETS[(idx + 1) % ANIMATION_SPEED_PRESETS.length];
+            this._store.markDirty();
+            this._store.save();
+            this._updateAnimSpeedLabel();
+            this._character.setAnimationSpeed?.(s.animationSpeed);
         });
-        menu.addMenuItem(exportCsvItem);
+        characterMenu.addMenuItem(this._animSpeedItem);
 
-        // Sound settings
+        // ── Sound ─────────────────────────────────────────────────────
+        const soundMenu = this._addSubMenu(menu, '🔔 Suara');
+
         const soundItem = new PopupMenu.PopupSwitchMenuItem(
             'Suara notifikasi', this._store.data.settings.soundEnabled);
         soundItem.connect('toggled', (_item, state) => {
@@ -830,7 +932,7 @@ _completePhase() {
             this._store.markDirty();
             this._store.save();
         });
-        menu.addMenuItem(soundItem);
+        soundMenu.addMenuItem(soundItem);
 
         const volumeItem = new PopupMenu.PopupBaseMenuItem({activate: false, can_focus: false});
         this._volumeLabel = new St.Label({
@@ -854,49 +956,11 @@ _completePhase() {
         volumeItem.add_child(volMinus);
         volumeItem.add_child(this._volumeLabel);
         volumeItem.add_child(volPlus);
-        menu.addMenuItem(volumeItem);
+        soundMenu.addMenuItem(volumeItem);
 
-        // Eye settings
-        this._eyeSenseItem = new PopupMenu.PopupMenuItem('');
-        this._updateEyeSenseLabel();
-        this._eyeSenseItem.connect('activate', () => {
-            const s = this._store.data.settings;
-            const idx = EYE_SENSITIVITY_PRESETS.indexOf(s.eyeSensitivity);
-            s.eyeSensitivity = EYE_SENSITIVITY_PRESETS[(idx + 1) % EYE_SENSITIVITY_PRESETS.length];
-            this._store.markDirty();
-            this._store.save();
-            this._updateEyeSenseLabel();
-            this._character.setEyeSensitivity?.(s.eyeSensitivity);
-        });
-        menu.addMenuItem(this._eyeSenseItem);
+        // ── Break ─────────────────────────────────────────────────────
+        const breakMenu = this._addSubMenu(menu, '☕ Istirahat');
 
-        this._blinkFreqItem = new PopupMenu.PopupMenuItem('');
-        this._updateBlinkFreqLabel();
-        this._blinkFreqItem.connect('activate', () => {
-            const s = this._store.data.settings;
-            const idx = BLINK_FREQUENCY_PRESETS.indexOf(s.blinkFrequency);
-            s.blinkFrequency = BLINK_FREQUENCY_PRESETS[(idx + 1) % BLINK_FREQUENCY_PRESETS.length];
-            this._store.markDirty();
-            this._store.save();
-            this._updateBlinkFreqLabel();
-            this._character.setBlinkFrequency?.(s.blinkFrequency);
-        });
-        menu.addMenuItem(this._blinkFreqItem);
-
-        this._animSpeedItem = new PopupMenu.PopupMenuItem('');
-        this._updateAnimSpeedLabel();
-        this._animSpeedItem.connect('activate', () => {
-            const s = this._store.data.settings;
-            const idx = ANIMATION_SPEED_PRESETS.indexOf(s.animationSpeed);
-            s.animationSpeed = ANIMATION_SPEED_PRESETS[(idx + 1) % ANIMATION_SPEED_PRESETS.length];
-            this._store.markDirty();
-            this._store.save();
-            this._updateAnimSpeedLabel();
-            this._character.setAnimationSpeed?.(s.animationSpeed);
-        });
-        menu.addMenuItem(this._animSpeedItem);
-
-        // Break suggestions
         const breakSuggestItem = new PopupMenu.PopupSwitchMenuItem(
             'Saran istirahat', this._store.data.settings.breakSuggestions);
         breakSuggestItem.connect('toggled', (_item, state) => {
@@ -904,7 +968,7 @@ _completePhase() {
             this._store.markDirty();
             this._store.save();
         });
-        menu.addMenuItem(breakSuggestItem);
+        breakMenu.addMenuItem(breakSuggestItem);
 
         const autoBreakItem = new PopupMenu.PopupSwitchMenuItem(
             'Auto mulai istirahat', this._store.data.settings.autoStartBreaks);
@@ -913,23 +977,75 @@ _completePhase() {
             this._store.markDirty();
             this._store.save();
         });
-        menu.addMenuItem(autoBreakItem);
+        breakMenu.addMenuItem(autoBreakItem);
 
-        // ── Reminder section ──────────────────────────────────────────
-        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('📝 Pengingat Harian'));
+        // ── Reminders ─────────────────────────────────────────────────
+        const reminderMenu = this._addSubMenu(menu, '⏰ Pengingat harian');
+        this._buildReminderInput(reminderMenu);
         this._reminderSection = new PopupMenu.PopupMenuSection();
-        menu.addMenuItem(this._reminderSection);
-        this._buildReminderInput();
+        reminderMenu.addMenuItem(this._reminderSection);
+        this._rebuildReminders();
 
-        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Durasi (menit)'));
+        // ── Durations ─────────────────────────────────────────────────
+        const durationMenu = this._addSubMenu(menu, '⏱ Durasi & target');
         this._durationLabels = {};
-        this._addStepper(menu, 'Fokus', 'focus');
-        this._addStepper(menu, 'Istirahat pendek', 'short');
-        this._addStepper(menu, 'Istirahat panjang', 'long');
+        this._addStepper(durationMenu, 'Fokus', 'focus');
+        this._addStepper(durationMenu, 'Istirahat pendek', 'short');
+        this._addStepper(durationMenu, 'Istirahat panjang', 'long');
+        durationMenu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._buildGoalStepper(durationMenu);
 
+        // ── Stats ─────────────────────────────────────────────────────
+        const statsMenu = this._addSubMenu(menu, '📊 Statistik');
         this._statsSection = new PopupMenu.PopupMenuSection();
-        menu.addMenuItem(this._statsSection);
+        statsMenu.addMenuItem(this._statsSection);
         this._rebuildStats();
+
+        // ── Data ──────────────────────────────────────────────────────
+        const dataMenu = this._addSubMenu(menu, '💾 Data');
+
+        this._saveStatusItem = new PopupMenu.PopupMenuItem('Penyimpanan: siap',
+            {reactive: false, can_focus: false});
+        dataMenu.addMenuItem(this._saveStatusItem);
+
+        const backupItem = new PopupMenu.PopupMenuItem('Simpan cadangan');
+        backupItem.connect('activate', () => {
+            this._saveTimer();
+            if (!this._store.save()) {
+                Main.notify('Cadangan gagal', 'Data belum tersimpan.');
+                return;
+            }
+            try {
+                const path = this._store.createBackup();
+                Main.notify('Cadangan tersimpan', `Di ${path}`);
+            } catch (e) {
+                console.error(`Pomodoro Mochi: gagal membuat cadangan: ${e}`);
+                Main.notify('Cadangan gagal', 'Gagal menulis file cadangan.');
+            }
+        });
+        dataMenu.addMenuItem(backupItem);
+
+        const exportJsonItem = new PopupMenu.PopupMenuItem('Ekspor JSON');
+        exportJsonItem.connect('activate', () => {
+            try {
+                const path = this._store.exportData();
+                Main.notify('Ekspor JSON', `Tersimpan di ${path}`);
+            } catch (e) {
+                Main.notify('Ekspor gagal', 'Gagal menulis file JSON.');
+            }
+        });
+        dataMenu.addMenuItem(exportJsonItem);
+
+        const exportCsvItem = new PopupMenu.PopupMenuItem('Ekspor CSV');
+        exportCsvItem.connect('activate', () => {
+            try {
+                const path = this._store.exportCSV();
+                Main.notify('Ekspor CSV', `Tersimpan di ${path}`);
+            } catch (e) {
+                Main.notify('Ekspor gagal', 'Gagal menulis file CSV.');
+            }
+        });
+        dataMenu.addMenuItem(exportCsvItem);
 
         this._menuOpenId = menu.connect('open-state-changed', (_menu, open) => {
             if (open) {
@@ -939,6 +1055,12 @@ _completePhase() {
         });
 
         Main.panel.addToStatusArea(this.uuid, this._indicator, 0, 'right');
+    }
+
+    _addSubMenu(menu, label) {
+        const sub = new PopupMenu.PopupSubMenuMenuItem(label);
+        menu.addMenuItem(sub);
+        return sub.menu;
     }
 
     _addStepper(menu, title, key) {
@@ -971,6 +1093,85 @@ _completePhase() {
         menu.addMenuItem(item);
     }
 
+    _buildTaskInput(menu) {
+        const item = new PopupMenu.PopupBaseMenuItem({activate: false, can_focus: false});
+        this._taskEntry = new St.Entry({
+            hint_text: 'Mau fokus apa?',
+            can_focus: true,
+            accessible_name: 'Label tugas sesi fokus',
+            style: 'min-width: 150px;',
+        });
+        this._taskEntry.x_expand = true;
+        this._taskEntry.set_text(this._store.data.settings.currentTask);
+        this._taskEntry.clutter_text.connect('activate', () => this._saveTaskLabel());
+        const saveButton = new St.Button({
+            label: 'Simpan',
+            style_class: 'button',
+            can_focus: true,
+            accessible_name: 'Simpan label tugas',
+            style: 'padding: 2px 8px;',
+        });
+        saveButton.connect('clicked', () => this._saveTaskLabel());
+        item.add_child(this._taskEntry);
+        item.add_child(saveButton);
+        menu.addMenuItem(item);
+    }
+
+    _saveTaskLabel() {
+        if (!this._taskEntry)
+            return;
+        const label = this._taskEntry.get_text().trim().slice(0, TASK_LABEL_MAX_LENGTH);
+        this._store.data.settings.currentTask = label;
+        this._taskEntry.set_text(label);
+        this._store.markDirty();
+        this._store.save();
+        this._rebuildStats();
+    }
+
+    _buildGoalStepper(menu) {
+        const item = new PopupMenu.PopupBaseMenuItem({activate: false, can_focus: false});
+        item.add_child(new St.Label({
+            text: 'Target harian',
+            x_expand: true,
+            y_align: Clutter.ActorAlign.CENTER,
+        }));
+        const minus = new St.Button({
+            label: '−',
+            style_class: 'button',
+            can_focus: true,
+            accessible_name: 'Kurangi target harian',
+            style: 'padding: 2px 12px;',
+        });
+        this._goalLabel = new St.Label({
+            y_align: Clutter.ActorAlign.CENTER,
+            style: 'min-width: 4em; text-align: center;',
+        });
+        this._updateGoalLabel();
+        const plus = new St.Button({
+            label: '+',
+            style_class: 'button',
+            can_focus: true,
+            accessible_name: 'Tambah target harian',
+            style: 'padding: 2px 12px;',
+        });
+        minus.connect('clicked', () => this._changeDailyGoal(-1));
+        plus.connect('clicked', () => this._changeDailyGoal(1));
+        item.add_child(minus);
+        item.add_child(this._goalLabel);
+        item.add_child(plus);
+        menu.addMenuItem(item);
+    }
+
+    _changeDailyGoal(delta) {
+        const [min, max] = DAILY_GOAL_LIMITS;
+        const settings = this._store.data.settings;
+        settings.dailyGoalSessions = Math.min(max, Math.max(min, settings.dailyGoalSessions + delta));
+        this._store.markDirty();
+        this._store.save();
+        this._updateGoalLabel();
+        this._rebuildStats();
+    }
+
     _changeDuration(key, delta, min, max) {
         const d = this._store.data.settings.durations;
         d[key] = Math.min(max, Math.max(min, d[key] + delta));
@@ -990,11 +1191,21 @@ _completePhase() {
     }
 
     _updateCornerLabel() {
-        this._cornerItem.label.text = `Posisi: ${CORNER_LABEL[this._store.data.settings.corner]} (seret buat pindah)`;
+        this._cornerItem.label.text = `Posisi: ${CORNER_LABEL[this._store.data.settings.corner]}`;
     }
 
     _updateSizeLabel() {
         this._sizeItem.label.text = `Ukuran: ${CHARACTER_SIZE_LABEL[this._store.data.settings.characterSize]}`;
+    }
+
+    _updateThemeLabel() {
+        this._themeItem.label.text =
+            `Tema: ${CHARACTER_THEME_LABEL[this._store.data.settings.characterTheme]}`;
+    }
+
+    _updateGoalLabel() {
+        if (this._goalLabel)
+            this._goalLabel.text = `${this._store.data.settings.dailyGoalSessions} sesi`;
     }
 
     _updateScaleLabel() {
@@ -1036,44 +1247,75 @@ _completePhase() {
     }
 
     _updateBlinkFreqLabel() {
-        this._blinkFreqItem.label.text = `Frekuensi kedip: ${BLINK_FREQUENCY_LABEL[this._store.data.settings.blinkFrequency]}`;
+        this._blinkFreqItem.label.text = `Kedip: ${BLINK_FREQUENCY_LABEL[this._store.data.settings.blinkFrequency]}`;
     }
 
     _updateAnimSpeedLabel() {
-        this._animSpeedItem.label.text = `Kecepatan animasi: ${ANIMATION_SPEED_LABEL[this._store.data.settings.animationSpeed]}`;
+        this._animSpeedItem.label.text = `Animasi: ${ANIMATION_SPEED_LABEL[this._store.data.settings.animationSpeed]}`;
     }
 
-    _buildReminderInput() {
+    _buildReminderInput(menu) {
         const item = new PopupMenu.PopupBaseMenuItem({activate: false, can_focus: false});
-        item.add_child(new St.Label({text: 'Tambah pengingat', x_expand: true, y_align: Clutter.ActorAlign.CENTER}));
+        const box = new St.BoxLayout({
+            orientation: Clutter.Orientation.VERTICAL,
+            style: 'spacing: 6px; padding: 2px 0;',
+        });
+        box.x_expand = true;
 
+        const topRow = new St.BoxLayout({
+            orientation: Clutter.Orientation.HORIZONTAL,
+            style: 'spacing: 6px;',
+        });
         const entry = new St.Entry({
-            hint_text: 'Contoh: minum air',
+            hint_text: 'Tambah pengingat…',
             can_focus: true,
             accessible_name: 'Teks pengingat',
-            style: 'min-width: 180px; margin-right: 8px;',
+            style: 'min-width: 160px;',
         });
-        entry.clutter_text.connect('activate', () => this._addReminderFromEntry(entry));
+        entry.x_expand = true;
 
-        const intervalBox = new St.BoxLayout({orientation: Clutter.Orientation.HORIZONTAL, style: 'spacing: 4px;'});
-        intervalBox.add_child(new St.Label({text: 'Tiap', y_align: Clutter.ActorAlign.CENTER}));
         const intervalEntry = new St.Entry({
-            hint_text: 'jam',
+            hint_text: '1',
             can_focus: true,
             accessible_name: 'Interval pengingat (jam)',
-            style: 'min-width: 40px; text-align: center;',
+            style: 'min-width: 42px; text-align: center;',
         });
-        intervalEntry.clutter_text.connect('activate', () => this._addReminderFromEntry(entry, intervalEntry));
-        intervalBox.add_child(intervalEntry);
-        intervalBox.add_child(new St.Label({text: 'jam', y_align: Clutter.ActorAlign.CENTER}));
 
-        const addBtn = new St.Button({label: 'Tambah', style_class: 'button', can_focus: true, style: 'padding: 2px 12px;'});
+        entry.clutter_text.connect('activate', () => this._addReminderFromEntry(entry, intervalEntry));
+        intervalEntry.clutter_text.connect('activate', () => this._addReminderFromEntry(entry, intervalEntry));
+
+        const addBtn = new St.Button({
+            label: 'Tambah',
+            style_class: 'button',
+            can_focus: true,
+            accessible_name: 'Tambah pengingat',
+            style: 'padding: 2px 12px;',
+        });
         addBtn.connect('clicked', () => this._addReminderFromEntry(entry, intervalEntry));
 
-        item.add_child(entry);
-        item.add_child(intervalBox);
-        item.add_child(addBtn);
-        this._reminderSection.addMenuItem(item);
+        topRow.add_child(entry);
+        topRow.add_child(addBtn);
+
+        const intervalRow = new St.BoxLayout({
+            orientation: Clutter.Orientation.HORIZONTAL,
+            style: 'spacing: 6px;',
+        });
+        intervalRow.add_child(new St.Label({
+            text: 'Ulangi tiap',
+            y_align: Clutter.ActorAlign.CENTER,
+            style: 'font-size: 9pt; color: #888;',
+        }));
+        intervalRow.add_child(intervalEntry);
+        intervalRow.add_child(new St.Label({
+            text: 'jam',
+            y_align: Clutter.ActorAlign.CENTER,
+            style: 'font-size: 9pt; color: #888;',
+        }));
+
+        box.add_child(topRow);
+        box.add_child(intervalRow);
+        item.add_child(box);
+        menu.addMenuItem(item);
     }
 
     _addReminderFromEntry(entry, intervalEntry) {
@@ -1097,7 +1339,8 @@ _completePhase() {
         this._reminderSection.removeAll();
         const reminders = this._store.getReminders();
         if (reminders.length === 0) {
-            const emptyItem = new PopupMenu.PopupMenuItem('Belum ada pengingat. Tambah di atas.', {reactive: false, can_focus: false});
+            const emptyItem = new PopupMenu.PopupMenuItem('Belum ada pengingat.',
+                {reactive: false, can_focus: false});
             this._reminderSection.addMenuItem(emptyItem);
             return;
         }
@@ -1116,14 +1359,15 @@ _completePhase() {
 
             const metaBox = new St.BoxLayout({orientation: Clutter.Orientation.HORIZONTAL, style: 'spacing: 8px;'});
             const intervalLabel = new St.Label({
-                text: `🔁 Tiap ${reminder.intervalHours} jam`,
+                text: `Tiap ${reminder.intervalHours} jam`,
                 style: 'color: #888; font-size: 9pt;',
+                y_align: Clutter.ActorAlign.CENTER,
             });
             metaBox.add_child(intervalLabel);
 
             const checkBtn = new St.Button({
-                label: reminder.checkedToday ? '✓ Selesai' : '☐ Belum',
-                style_class: reminder.checkedToday ? 'button' : 'button',
+                label: reminder.checkedToday ? '✓ Selesai' : 'Belum',
+                style_class: 'button',
                 can_focus: true,
                 accessible_name: reminder.checkedToday
                     ? `Tandai pengingat ${reminder.text} belum selesai`
@@ -1138,7 +1382,7 @@ _completePhase() {
             metaBox.add_child(checkBtn);
 
             const delBtn = new St.Button({
-                label: '🗑 Hapus',
+                label: 'Hapus',
                 style_class: 'button',
                 can_focus: true,
                 accessible_name: `Hapus pengingat ${reminder.text}`,
@@ -1166,12 +1410,15 @@ _completePhase() {
             new PopupMenu.PopupMenuItem(text, {reactive: false, can_focus: false}));
 
         const t = this._store.today();
-        this._statsSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Statistik hari ini'));
+        const goal = this._store.data.settings.dailyGoalSessions;
+        this._statsSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Hari ini'));
         add(`◷ Sesi fokus: ${t.sessions}`);
-        add(`⏱ Waktu fokus: ${fmtDuration(t.focusSeconds)}`);
+        add(`🎯 Target: ${Math.min(t.sessions, goal)}/${goal} sesi`);
+        add(`🔥 Streak: ${this._store.getStreak(goal)} hari`);
+        add(`⏱ Total fokus: ${fmtDuration(t.focusSeconds)}`);
         add(`💙 Elusan: ${t.pets}`);
-        add(`💢 Ngambek: ${t.sulks}x`);
-        add(`⏭ Dilewatin: ${t.skipped}`);
+        add(`💢 Ngambek: ${t.sulks}×`);
+        add(`⏭ Dilewati: ${t.skipped}`);
 
         this._statsSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('7 hari terakhir'));
         for (let i = 6; i >= 0; i--) {
@@ -1180,6 +1427,24 @@ _completePhase() {
             const day = this._store.dayOrEmpty(dayKey(d));
             add(`${DAY_NAMES[d.getDay()]} ${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}: ` +
                 `${day.sessions} sesi · ${fmtDuration(day.focusSeconds)}`);
+        }
+
+        this._statsSection.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Per tugas (90 hari)'));
+        const taskTotals = new Map();
+        for (const session of this._store.data.taskSessions) {
+            const total = taskTotals.get(session.task) ?? {sessions: 0, seconds: 0};
+            total.sessions++;
+            total.seconds += session.durationSeconds;
+            taskTotals.set(session.task, total);
+        }
+        const topTasks = [...taskTotals.entries()]
+            .sort((a, b) => b[1].seconds - a[1].seconds)
+            .slice(0, 3);
+        if (topTasks.length === 0) {
+            add('Belum ada sesi dengan label tugas');
+        } else {
+            for (const [task, total] of topTasks)
+                add(`📌 ${task}: ${total.sessions} sesi · ${fmtDuration(total.seconds)}`);
         }
     }
 
@@ -1195,6 +1460,8 @@ _completePhase() {
     }
 
     _refresh() {
+        if (!this._label || !this._statusItem || !this._toggleItem)
+            return;
         const rem = this._remaining;
         const time = `${pad2(Math.floor(rem / 60))}:${pad2(rem % 60)}`;
         let icon = this._phase === 'focus' ? '◷' : '☕';
@@ -1205,9 +1472,9 @@ _completePhase() {
         const phaseName = this._phase === 'focus'
             ? `Fokus — sesi ${this._cycle % CFG.cyclesBeforeLong + 1}/${CFG.cyclesBeforeLong}`
             : this._phase === 'short' ? 'Istirahat pendek' : 'Istirahat panjang';
-        const state = this._running ? 'jalan' : this._started() ? 'pause' : 'siap';
+        const state = this._running ? 'berjalan' : this._started() ? 'jeda' : 'siap';
         this._label.accessible_name = `${phaseName}, ${state}, sisa ${Math.floor(rem / 60)} menit ${rem % 60} detik`;
-        this._statusItem.label.text = `${phaseName} (${state})`;
+        this._statusItem.label.text = `${phaseName} · ${state}`;
         this._toggleItem.label.text = this._running ? 'Jeda' : this._started() ? 'Lanjut' : 'Mulai';
         this._character?.setTimer(this._phase, this._running, this._remaining);
     }

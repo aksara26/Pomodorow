@@ -33,11 +33,10 @@ const REDUCED_TICK_MS = 100;
 // Eye travel is derived from the generated face geometry: how far an iris can
 // slide before it would poke out of the socket. Source pixels, see EYES in
 // tools/build_character_assets.py. Screen travel scales with the display size.
-// Left eye center: (197.5, 96.0), Right eye center: (249.5, 109.5)
-// Iris radius: (7.4, 5.7). Socket bounds allow ~14px horizontal, ~5px vertical travel.
+// Sockets are scaled by EYE_SCALE there; iris radius is 8.3 x 6.7.
 const EYE_GEO = {
-    travelX: 14,
-    travelY: 5,
+    travelX: 3.9,
+    travelY: 1.7,
     pivotLeft: [197.5 / 400, 96.0 / 400],   // [0.49375, 0.24]
     pivotRight: [249.5 / 400, 109.5 / 400], // [0.62375, 0.27375]
 };
@@ -126,6 +125,7 @@ const EYE_BEHAVIOR = {
     studying: { pupilBase: 0.97, pupilRange: 0.08, saccadeSpeed: 1.2, blinkStyle: 'micro', squint: 0.15 },
     resting: { pupilBase: 1.0, pupilRange: 0.12, saccadeSpeed: 0.8, blinkStyle: 'soft', squint: 0 },
     sleepy: { pupilBase: 0.9, pupilRange: 0.05, saccadeSpeed: 0.5, blinkStyle: 'dreamy', squint: 0.3 },
+    sleeping: { pupilBase: 0.8, pupilRange: 0.02, saccadeSpeed: 0.2, blinkStyle: 'dreamy', squint: 0.5 },
     bored: { pupilBase: 0.94, pupilRange: 0.06, saccadeSpeed: 0.7, blinkStyle: 'slow', squint: 0.1 },
     grumpy: { pupilBase: 0.94, pupilRange: 0.04, saccadeSpeed: 1.0, blinkStyle: 'slow', squint: 0.25 },
     ignored: { pupilBase: 0.92, pupilRange: 0.03, saccadeSpeed: 0.6, blinkStyle: 'tired', squint: 0.2 },
@@ -167,6 +167,7 @@ const EXPRESSIONS = {
     focused: {mouth: 'determined', lid: 'half', head: 1.2, blush: 0, gazeY: 0.55},
     curious: {mouth: 'o', lid: 'open', head: 3, blush: 0.15, gazeX: 0.55},
     sleepy: {mouth: 'yawn', lid: 'half', head: 2.4, blush: 0.25, gazeY: 0.35},
+    sleeping: {mouth: 'neutral', lid: 'closed', head: 2.8, blush: 0.2, gazeY: 0.5},
     bored: {mouth: 'pout', lid: 'half', head: 3.4, blush: 0, gazeX: -0.65},
     grumpy: {mouth: 'frown', lid: 'half', head: -2.2, blush: 0, brow: 'angry', gazeX: -0.4},
     surprised: {mouth: 'o', lid: 'open', head: -3, blush: 0.35, gazeY: -0.2},
@@ -189,6 +190,7 @@ const STATE_EXPRESSION = {
     resting: 'relaxed',
     bored: 'bored',
     sleepy: 'sleepy',
+    sleeping: 'sleeping',
     grumpy: 'grumpy',
     ignored: 'grumpy',
     happy: 'happy',
@@ -264,6 +266,12 @@ const DIALOGUE = {
         'Ngantuk dikit... tapi aku nemenin kamu.',
         'Hmm... *yawn* jangan sendirian.',
         'Jangan lupa istirahat.',
+    ],
+    sleeping: [
+        'Zzz... 💤',
+        '...nyenyak... 😴',
+        'Mimpi indah... ✨',
+        'Zzz... aku di sini kok...',
     ],
     click: [
         'Eh? Hehe.',
@@ -400,6 +408,8 @@ const BEHAVIORS = {
             expression: 'sleepy', head: 4, gazeY: 0.5},
         {id: 'slow-blink', weight: 1, duration: [1.8, 2.5], gap: [16, 28], cool: 28,
             expression: 'sleepy', lid: 'half', head: 2},
+        {id: 'sleeping', weight: 1.5, duration: [4, 7], gap: [20, 35], cool: 30,
+            expression: 'sleeping', head: 3, say: 'sleeping', sayChance: 0.3},
     ],
     studying: [
         {id: 'read', weight: 3, duration: [3.5, 6], gap: [8, 16], cool: 12,
@@ -430,6 +440,8 @@ const BEHAVIORS = {
             expression: 'happy', head: 2.5, bounce: true},
         {id: 'relax', weight: 2, duration: [3, 4.5], gap: [10, 20], cool: 18,
             expression: 'relaxed', head: 1.5},
+        {id: 'sleeping', weight: 1, duration: [5, 10], gap: [25, 40], cool: 40,
+            expression: 'sleeping', head: 3.5, say: 'sleeping', sayChance: 0.2},
         {id: 'remind-break', weight: 1.2, duration: [2, 2.8], gap: [20, 35], cool: 35,
             expression: 'smiling', head: 1, say: 'breakIdle', sayChance: 0.6},
     ],
@@ -490,6 +502,7 @@ export default class Character {
     constructor(extDir, options = {}) {
         this._extDir = extDir;
         this._options = options;
+        this._theme = 'classic';
         this._enabled = false;
         this._destroyed = false;
         this._suspended = false;
@@ -649,12 +662,23 @@ export default class Character {
         return new Gio.FileIcon({file: Gio.File.new_for_path(path)});
     }
 
+    _iconExists(relPath) {
+        try {
+            return GLib.file_test(
+                GLib.build_filenamev([this._extDir, 'images', relPath]),
+                GLib.FileTest.IS_REGULAR);
+        } catch (e) {
+            return false;
+        }
+    }
+
     _loadIcons() {
         const icons = {};
         const required = [
             'character/head.png', 'character/body.png', 'character/blush.png', 'character/hearts.png',
             'character/brow_neutral.png', 'character/brow_angry.png', 'character/brow_shy.png', 'character/brow_confused.png',
             'character/iris_left.png', 'character/iris_right.png',
+            'character/accessory_bow.png', 'character/accessory_flower.png',
             'character/lid_left_quarter.png', 'character/lid_left_three-quarter.png', 'character/lid_left_closed.png',
             'character/lid_left_half.png', 'character/lid_left_happy.png',
             'character/lid_right_quarter.png', 'character/lid_right_three-quarter.png', 'character/lid_right_closed.png',
@@ -668,20 +692,14 @@ export default class Character {
         const optional = ['character/eye_frame.png'];
         let missing = [];
         for (const relPath of required) {
-            const icon = this._icon(relPath);
-            const file = icon.get_file();
-            if (!file.query_exists(null)) {
+            if (!this._iconExists(relPath))
                 missing.push(relPath);
-            }
-            const name = relPath.replace('character/', '').replace('.png', '').replace(/-/g, '-');
-            icons[name.replace('character/', '')] = icon;
+            const name = relPath.replace('character/', '').replace('.png', '');
+            icons[name] = this._icon(relPath);
         }
         for (const relPath of optional) {
-            const icon = this._icon(relPath);
-            const file = icon.get_file();
-            if (file.query_exists(null)) {
-                icons['eye-frame'] = icon;
-            }
+            if (this._iconExists(relPath))
+                icons['eye-frame'] = this._icon(relPath);
         }
         if (missing.length > 0) {
             log('[Mochi] MISSING icons: ' + missing.join(', '));
@@ -703,6 +721,8 @@ export default class Character {
         for (const mouth of ['neutral', 'smile', 'open', 'laugh', 'pout', 'yawn', 'o', 'frown', 'smirk', 'determined']) {
             mapped[`mouth-${mouth}`] = icons[`mouth_${mouth}`];
         }
+        mapped['accessory-bow'] = icons.accessory_bow;
+        mapped['accessory-flower'] = icons.accessory_flower;
         mapped.sulk = icons.sulk;
         if (icons['eye-frame']) mapped['eye-frame'] = icons['eye-frame'];
         return mapped;
@@ -720,7 +740,6 @@ export default class Character {
     }
 
     _build() {
-        log('[Mochi] _build() started');
         const L = this._layout;
         this._actor = new St.Widget({
             layout_manager: new Clutter.FixedLayout(),
@@ -785,6 +804,10 @@ export default class Character {
         this._headGroup.add_child(this._lidLeft);
         this._headGroup.add_child(this._lidRight);
 
+        this._accessory = this._newIcon(this._icons['accessory-bow'], 0);
+        this._headGroup.add_child(this._accessory);
+        this.setTheme(this._theme);
+
         this._hearts = this._newIcon(this._icons.hearts, 0);
         this._stage.add_child(this._hearts);
 
@@ -819,9 +842,7 @@ export default class Character {
         this._buildDoomBlocker();
 
         this._refreshVisual();
-        log('[Mochi] _refreshVisual called');
         this._placeActor();
-        log('[Mochi] _build() complete');
     }
 
     _buildDoomBlocker() {
@@ -906,6 +927,21 @@ export default class Character {
         this._doomBlockerActor.connect('button-press-event', () => this._dismissDoomBlocker());
         this._doomBlockerActor.connect('touch-event', () => this._dismissDoomBlocker());
 
+        // Drop every reference as soon as the shell destroys the chrome. On
+        // logout the UI group is torn down for us, and touching a disposed
+        // actor afterwards logs a Gjs critical.
+        this._doomBlockerActor.connect('destroy', () => {
+            this._doomBlockerActor = null;
+            this._doomCharBody = null;
+            this._doomCharHeadGroup = null;
+            this._doomCharHead = null;
+            this._doomCharMouth = null;
+            this._doomCharLidLeft = null;
+            this._doomCharLidRight = null;
+            this._doomBubble = null;
+            this._doomHint = null;
+        });
+
         // Add to top chrome (above everything)
         Main.layoutManager.addTopChrome(this._doomBlockerActor);
     }
@@ -916,7 +952,11 @@ export default class Character {
         this._disconnectDragEvents();
         if (this._actor) {
             if (this._inChrome) {
-                Main.layoutManager.removeChrome(this._actor);
+                try {
+                    Main.layoutManager.removeChrome(this._actor);
+                } catch (e) {
+                    // The layout manager may already be torn down on shutdown.
+                }
                 this._inChrome = false;
             }
             this._actor.destroy();
@@ -942,6 +982,7 @@ export default class Character {
         this._irisLeft = null;
         this._irisRight = null;
         this._eyeFrame = null;
+        this._accessory = null;
         this._lidLeft = null;
         this._lidRight = null;
         this._hearts = null;
@@ -955,8 +996,13 @@ export default class Character {
         this._blinkFrame = 'open';
         // Clean up doom blocker
         if (this._doomBlockerActor) {
-            Main.layoutManager.removeChrome(this._doomBlockerActor);
-            this._doomBlockerActor.destroy();
+            try {
+                if (this._doomBlockerActor.get_parent())
+                    Main.layoutManager.removeChrome(this._doomBlockerActor);
+                this._doomBlockerActor.destroy();
+            } catch (e) {
+                // Shell shutdown can dispose chrome before we get here.
+            }
             this._doomBlockerActor = null;
         }
         this._doomCharBody = null;
@@ -1059,6 +1105,19 @@ export default class Character {
     setAnimationSpeed(level) {
         // Adjust animation timing via multiplier
         this._animMult = {slow: 0.7, normal: 1, fast: 1.4}[level] ?? 1;
+    }
+
+    setTheme(theme) {
+        this._theme = theme === 'bow' || theme === 'flower' ? theme : 'classic';
+        if (!this._accessory)
+            return;
+        if (this._theme === 'classic') {
+            this._accessory.hide();
+            return;
+        }
+        this._accessory.gicon = this._icons[`accessory-${this._theme}`];
+        this._accessory.opacity = 255;
+        this._accessory.show();
     }
 
     setSize(name) {
@@ -1977,8 +2036,8 @@ export default class Character {
             }
         }
 
-        this._gazeTargetX = clamp(tx ?? 0, -0.82, 0.82);
-        this._gazeTargetY = clamp(ty ?? 0, -0.72, 0.72);
+        this._gazeTargetX = clamp(tx ?? 0, -0.58, 0.58);
+        this._gazeTargetY = clamp(ty ?? 0, -0.45, 0.45);
 
         // Smoother gaze tracking with configurable speed
         const gazeAlpha = 1 - Math.pow(0.002 / eyeBehavior.saccadeSpeed, dt);
@@ -1986,7 +2045,8 @@ export default class Character {
         this._gazeY = lerp(this._gazeY, this._gazeTargetY, gazeAlpha);
 
         // Pupils
-        this._irisScale = lerp(this._irisScale ?? 1, this._pupilTarget(), 0.06);
+        const fullyClosed = this._blinkActive && this._blinkFrame === 'closed';
+        this._irisScale = fullyClosed ? 0 : lerp(this._irisScale ?? 1, this._pupilTarget(), 0.06);
 
         if (this._irisLeft) {
             const L = this._layout;
@@ -1996,7 +2056,7 @@ export default class Character {
             this._irisLeft.translation_y = gy;
             this._irisRight.translation_x = gx;
             this._irisRight.translation_y = gy;
-            const s = this._reducedMotion ? 1 : this._irisScale;
+            const s = this._reducedMotion && !fullyClosed ? 1 : this._irisScale;
             this._irisLeft.scale_x = s;
             this._irisLeft.scale_y = s;
             this._irisRight.scale_x = s;
@@ -2005,7 +2065,7 @@ export default class Character {
 
         // Squint effect for certain states (focused, suspicious, bright light simulation)
         const squintAmount = eyeBehavior.squint ?? 0;
-        if (squintAmount > 0 && !this._blinkActive) {
+        if (squintAmount > 0 && !this._blinkActive && this._visual.lid !== 'closed') {
             const squintLid = squintAmount > 0.25 ? 'quarter' : 'half';
             this._applyLids(squintLid);
         }
@@ -2123,6 +2183,15 @@ export default class Character {
         const [ms, lid] = frames[this._blinkIndex];
         this._blinkFrame = lid;
         this._blinkNextAt = now + ms;
+        if (lid === 'closed') {
+            this._irisScale = 0;
+            if (this._irisLeft) {
+                this._irisLeft.scale_x = 0;
+                this._irisLeft.scale_y = 0;
+                this._irisRight.scale_x = 0;
+                this._irisRight.scale_y = 0;
+            }
+        }
         this._applyLids(lid);
     }
 
